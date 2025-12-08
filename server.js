@@ -165,14 +165,14 @@ app.post("/order", async (req, res) => {
     }
 });
 // ------------------------
-// GET BREAK-EVEN FOR SYMBOL
+// GET BREAK-EVEN FOR SYMBOL (OPEN POSITIONS ONLY)
 // ------------------------
 app.get("/breakeven/:symbol", async (req, res) => {
     try {
         const symbol = req.params.symbol.toUpperCase();
         const ts = Date.now();
 
-        // Sign and fetch all filled trades for this symbol
+        // 1. Fetch all trades
         const query = `symbol=${symbol}&timestamp=${ts}`;
         const sig = crypto
             .createHmac("sha256", API_SECRET)
@@ -183,19 +183,36 @@ app.get("/breakeven/:symbol", async (req, res) => {
             headers: { "X-MBX-APIKEY": API_KEY }
         });
 
-        const trades = tradesResp.data.filter(t => t.isBuyer); // only buys
+        const trades = tradesResp.data;
+
         if (!trades.length) return res.json({ averagePrice: 0, breakEven: 0, totalQuantity: 0, totalSpent: 0 });
 
+        // 2. Calculate open position by netting buys and sells
         let totalQty = 0, totalSpent = 0;
+
         trades.forEach(t => {
             const qty = parseFloat(t.qty);
             const price = parseFloat(t.price);
-            totalQty += qty;
-            totalSpent += qty * price;
+
+            if (t.isBuyer) {
+                totalQty += qty;
+                totalSpent += qty * price;
+            } else {
+                // subtract sold quantity from totalSpent proportionally
+                if (totalQty > 0) {
+                    const avgPrice = totalSpent / totalQty;
+                    totalQty -= qty;
+                    totalSpent -= qty * avgPrice;
+                    if (totalQty < 0) totalQty = 0;
+                    if (totalSpent < 0) totalSpent = 0;
+                }
+            }
         });
 
-        const breakEven = totalSpent / totalQty;
-        console.log(`Break-even for ${symbol}: $${breakEven.toFixed(8)} over ${totalQty.toFixed(8)} units`);
+        const breakEven = totalQty > 0 ? totalSpent / totalQty : 0;
+
+        console.log(`Open position break-even for ${symbol}: $${breakEven.toFixed(8)} over ${totalQty.toFixed(8)} units`);
+
         res.json({
             averagePrice: breakEven.toFixed(8),
             breakEven: breakEven.toFixed(8),
@@ -208,6 +225,7 @@ app.get("/breakeven/:symbol", async (req, res) => {
         res.status(500).json({ error: err.response?.data || err.message });
     }
 });
+
 
 // ----------------------------------------
 app.listen(5000, () =>
