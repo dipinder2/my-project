@@ -165,12 +165,13 @@ app.post("/order", async (req, res) => {
     }
 });
 // ------------------------
-// GET BREAK-EVEN FOR SYMBOL (OPEN POSITIONS ONLY)
+// GET BREAK-EVEN FOR SYMBOL (OPEN POSITIONS ONLY, WITH FEES)
 // ------------------------
 app.get("/breakeven/:symbol", async (req, res) => {
     try {
         const symbol = req.params.symbol.toUpperCase();
         const ts = Date.now();
+        const FEE_RATE = parseFloat(process.env.BINANCE_FEE || 0.001); // default 0.1%
 
         // 1. Fetch all trades
         const query = `symbol=${symbol}&timestamp=${ts}`;
@@ -187,18 +188,21 @@ app.get("/breakeven/:symbol", async (req, res) => {
 
         if (!trades.length) return res.json({ averagePrice: 0, breakEven: 0, totalQuantity: 0, totalSpent: 0 });
 
-        // 2. Calculate open position by netting buys and sells
+        // 2. Calculate open position by netting buys and sells, accounting for fees
         let totalQty = 0, totalSpent = 0;
 
         trades.forEach(t => {
             const qty = parseFloat(t.qty);
             const price = parseFloat(t.price);
 
+            // fee is in quote currency, so multiply by price * feeRate
+            const feeCost = qty * price * FEE_RATE;
+
             if (t.isBuyer) {
                 totalQty += qty;
-                totalSpent += qty * price;
+                totalSpent += qty * price + feeCost; // include fee
             } else {
-                // subtract sold quantity from totalSpent proportionally
+                // proportionally remove sold qty and fees
                 if (totalQty > 0) {
                     const avgPrice = totalSpent / totalQty;
                     totalQty -= qty;
@@ -211,7 +215,7 @@ app.get("/breakeven/:symbol", async (req, res) => {
 
         const breakEven = totalQty > 0 ? totalSpent / totalQty : 0;
 
-        console.log(`Open position break-even for ${symbol}: $${breakEven.toFixed(8)} over ${totalQty.toFixed(8)} units`);
+        console.log(`Open position break-even for ${symbol} (with fees): $${breakEven.toFixed(8)} over ${totalQty.toFixed(8)} units`);
 
         res.json({
             averagePrice: breakEven.toFixed(8),
