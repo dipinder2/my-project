@@ -1,6 +1,6 @@
 // ------------------------------
-// Binance.US API Local Backend
-// With Break-even / Average Price Calculation
+// Binance.US Spot Backend
+// Open Positions + Break-even + P&L (RATE-LIMIT SAFE)
 // ------------------------------
 
 const express = require("express");
@@ -14,224 +14,231 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// API KEYS
 const API_KEY = process.env.BINANCE_API_KEY;
 const API_SECRET = process.env.BINANCE_API_SECRET;
 const BASE = "https://api.binance.us";
+const FEE_RATE = parseFloat(process.env.BINANCE_FEE || 0.001);
 
-console.log("Using API Key:", API_KEY);
+// ------------------------------
+// SIMPLE IN-MEMORY CACHE
+// ------------------------------
+const cache = {
+    account: { data: null, ts: 0 },
+    trades: {},   // symbol -> { data, ts }
+    prices: {}    // symbol -> { price, ts }
+};
 
-// ----------------------------------------
-// SIGN REQUEST
-// ----------------------------------------
+const ACCOUNT_TTL = 5000;   // 5s
+const TRADES_TTL  = 60000;  // 60s
+const PRICE_TTL   = 5000;   // 5s
+
+// ------------------------------
+// SIGN QUERY
+// ------------------------------
 function signQuery(params) {
     const qs = new URLSearchParams(params).toString();
     const sig = crypto.createHmac("sha256", API_SECRET).update(qs).digest("hex");
     return qs + "&signature=" + sig;
 }
 
-// ----------------------------------------
-// COUNT DECIMALS
-// ----------------------------------------
-function countDecimals(num) {
-    const s = num.toString();
-    if (s.includes("e") || s.includes("E")) {
-        const [base, exp] = s.split(/e/i);
-        const e = parseInt(exp, 10);
-        const dec = (base.split('.')[1] || '').length;
-        return Math.max(0, dec - e);
+// ------------------------------
+// CACHED HELPERS
+// ------------------------------
+async function getAccountCached() {
+    if (cache.account.data && Date.now() - cache.account.ts < ACCOUNT_TTL) {
+        return cache.account.data;
     }
-    if (s.indexOf('.') >= 0) return s.split('.')[1].length;
-    return 0;
+
+    const qs = signQuery({ timestamp: Date.now() });
+    const r = await axios.get(`${BASE}/api/v3/account?${qs}`, {
+        headers: { "X-MBX-APIKEY": API_KEY }
+    });
+
+    cache.account = { data: r.data, ts: Date.now() };
+    return r.data;
 }
 
-// ROUND PRICE
-function roundPrice(price, tickSize) {
-    const decimals = countDecimals(tickSize);
-    return (Math.floor(price / tickSize) * tickSize).toFixed(decimals);
+async function getTradesCached(symbol) {
+    const c = cache.trades[symbol];
+    if (c && Date.now() - c.ts < TRADES_TTL) return c.data;
+
+    const q = `symbol=${symbol}&timestamp=${Date.now()}`;
+    const sig = crypto.createHmac("sha256", API_SECRET).update(q).digest("hex");
+
+    const r = await axios.get(`${BASE}/api/v3/myTrades?${q}&signature=${sig}`, {
+        headers: { "X-MBX-APIKEY": API_KEY }
+    });
+
+    cache.trades[symbol] = { data: r.data, ts: Date.now() };
+    return r.data;
 }
 
-// ADJUST QTY TO LOT SIZE
-function adjustQtyForLotSize(qty, stepSize, minQty) {
-    let n = Math.floor(qty / stepSize) * stepSize;
-    if (n < minQty) n = minQty;
-    const decimals = countDecimals(stepSize);
-    return n.toFixed(decimals);
+async function getPriceCached(symbol) {
+    const c = cache.prices[symbol];
+    if (c && Date.now() - c.ts < PRICE_TTL) return c.price;
+
+    const r = await axios.get(`${BASE}/api/v3/ticker/price?symbol=${symbol}`);
+    const price = parseFloat(r.data.price);
+
+    cache.prices[symbol] = { price, ts: Date.now() };
+    return price;
 }
 
-// GET QUOTE CURRENCY
-function getQuoteCurrency(symbol) {
-    if (symbol.endsWith("USDT")) return "USDT";
-    if (symbol.endsWith("USDC")) return "USDC";
-    if (symbol.endsWith("USD")) return "USD";
-    return null;
-}
-
-// GET FILTERS
-async function getFilters(symbol) {
-    const r = await axios.get(`${BASE}/api/v3/exchangeInfo?symbol=${symbol}`);
-    const fs = r.data.symbols[0].filters;
-
-    const lot = fs.find(f => f.filterType === "LOT_SIZE");
-    const priceFilter = fs.find(f => f.filterType === "PRICE_FILTER");
-
-    return {
-        minQty: parseFloat(lot.minQty),
-        stepSize: parseFloat(lot.stepSize),
-        tickSize: parseFloat(priceFilter.tickSize),
-    };
-}
-
-// ----------------------------------------
-// GET BALANCES
-// ----------------------------------------
+// ------------------------------
+// BALANCES
+// ------------------------------
 app.get("/balances", async (req, res) => {
     try {
-        const ts = Date.now();
-        const query = signQuery({ timestamp: ts });
+        const acct = await getAccountCached();
 
-        const r = await axios.get(`${BASE}/api/v3/account?${query}`, {
-            headers: { "X-MBX-APIKEY": API_KEY }
-        });
-
-        const balances = r.data.balances
+        const balances = acct.balances
             .map(b => ({
                 asset: b.asset,
                 free: b.free,
                 locked: b.locked,
-                total: (parseFloat(b.free) + parseFloat(b.locked)).toFixed(12)
+                total: (parseFloat(b.free) + parseFloat(b.locked)).toFixed(8)
             }))
             .filter(b => parseFloat(b.total) > 0);
 
         res.json(balances);
-    } catch (err) {
-        res.status(500).json({ error: err.response?.data || err.message });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
-// ----------------------------------------
-// PLACE ORDER
-// ----------------------------------------
-app.post("/order", async (req, res) => {
+// ------------------------------
+// POSITIONS (OPEN ONLY, >$10, FIFO, FEES)
+// ------------------------------
+app.get("/positions", async (req, res) => {
     try {
-        const { symbol, side, quantity, price, usdAmount } = req.body;
+        const acct = await getAccountCached();
+        console.log("Calculating positions for account:", acct.accountType);
+        const assets = acct.balances
+            .map(b => ({
+                asset: b.asset,
+                qty: parseFloat(b.free) + parseFloat(b.locked)
+            }))
+            .filter(b =>
+                b.qty > 0 &&
+                !["USD", "USDT", "USDC"].includes(b.asset)
+            );
 
-        if (!symbol || !side || (!quantity && !usdAmount) || !price) {
-            return res.status(400).json({ error: "Missing required fields" });
+        const positions = [];
+
+        for (const a of assets) {
+            const symbolCandidates = [
+                `${a.asset}USDT`,
+                `${a.asset}USDC`,
+                `${a.asset}USD`
+            ];
+
+            let symbol = null;
+            let trades = null;
+            let price = null;
+
+            // Resolve correct symbol safely
+            for (const s of symbolCandidates) {
+                try {
+                    const t = await getTradesCached(s);
+                    if (!t.length) continue;
+
+                    symbol = s;
+                    trades = t;
+                    price = await getPriceCached(s);
+                    break;
+                } catch {}
+            }
+
+            if (!symbol || !trades || price === null) continue;
+
+            // FIFO open-position calculation
+            let openQty = 0;
+            let openCost = 0;
+
+            for (const t of trades) {
+                const qty = parseFloat(t.qty);
+                const p = parseFloat(t.price);
+                const fee = qty * p * FEE_RATE;
+
+                if (t.isBuyer) {
+                    openQty += qty;
+                    openCost += qty * p + fee;
+                } else if (openQty > 0) {
+                    const avg = openCost / openQty;
+                    openQty -= qty;
+                    openCost -= qty * avg;
+                    if (openQty < 0) openQty = 0;
+                    if (openCost < 0) openCost = 0;
+                }
+            }
+
+            if (openQty <= 0) continue;
+
+            const value = openQty * price;
+            if (value < 10) continue; // 🔥 filter <$10
+
+            const breakEven = openCost / openQty;
+            const pnl = (price - breakEven) * openQty;
+
+            positions.push({
+                symbol,
+                positionAmt: openQty.toFixed(8),
+                breakEven: breakEven.toFixed(8),
+                entryPrice: breakEven.toFixed(8),
+                currentPrice: price.toFixed(8),
+                marketValue: value.toFixed(2),
+                unrealizedPL: pnl.toFixed(2)
+            });
         }
 
-        const filters = await getFilters(symbol);
-        const quote = getQuoteCurrency(symbol);
+        res.json(positions);
 
-        let qty;
-
-        if (quantity) {
-            qty = Number(quantity);
-        } else if (usdAmount) {
-            qty = usdAmount / price;
-        }
-
-        if (side === "SELL" && !quantity) {
-            const base = symbol.replace(quote, "");
-            const bals = await axios.get("http://localhost:5000/balances");
-            const bal = bals.data.find(b => b.asset === base);
-            if (!bal) return res.status(400).json({ error: `No balance found for ${base}` });
-            qty = parseFloat(bal.total);
-        }
-
-        const finalQty = adjustQtyForLotSize(qty, filters.stepSize, filters.minQty);
-        const finalPrice = roundPrice(price, filters.tickSize);
-
-        const params = {
-            symbol,
-            side,
-            type: "LIMIT",
-            timeInForce: "GTC",
-            quantity: finalQty,
-            price: finalPrice,
-            timestamp: Date.now()
-        };
-
-        const qs = signQuery(params);
-        const r = await axios.post(`${BASE}/api/v3/order`, qs, {
-            headers: { "X-MBX-APIKEY": API_KEY }
-        });
-
-        res.json(r.data);
-
-    } catch (err) {
-        console.log("ORDER ERROR:", err.response?.data || err.message);
-        res.status(500).json({ error: err.response?.data || err.message });
+    } catch (e) {
+        console.error("Positions error:", e.message);
+        res.status(500).json({ error: e.message });
     }
 });
-// ------------------------
-// GET BREAK-EVEN FOR SYMBOL (OPEN POSITIONS ONLY, WITH FEES)
-// ------------------------
+
+// ------------------------------
+// BREAK-EVEN (CONSISTENT WITH POSITIONS)
+// ------------------------------
 app.get("/breakeven/:symbol", async (req, res) => {
     try {
         const symbol = req.params.symbol.toUpperCase();
-        const ts = Date.now();
-        const FEE_RATE = parseFloat(process.env.BINANCE_FEE || 0.001); // default 0.1%
+        const trades = await getTradesCached(symbol);
 
-        // 1. Fetch all trades
-        const query = `symbol=${symbol}&timestamp=${ts}`;
-        const sig = crypto
-            .createHmac("sha256", API_SECRET)
-            .update(query)
-            .digest("hex");
+        let qty = 0;
+        let cost = 0;
 
-        const tradesResp = await axios.get(`${BASE}/api/v3/myTrades?${query}&signature=${sig}`, {
-            headers: { "X-MBX-APIKEY": API_KEY }
-        });
-
-        const trades = tradesResp.data;
-
-        if (!trades.length) return res.json({ averagePrice: 0, breakEven: 0, totalQuantity: 0, totalSpent: 0 });
-
-        // 2. Calculate open position by netting buys and sells, accounting for fees
-        let totalQty = 0, totalSpent = 0;
-
-        trades.forEach(t => {
-            const qty = parseFloat(t.qty);
-            const price = parseFloat(t.price);
-
-            // fee is in quote currency, so multiply by price * feeRate
-            const feeCost = qty * price * FEE_RATE;
+        for (const t of trades) {
+            const q = parseFloat(t.qty);
+            const p = parseFloat(t.price);
+            const fee = q * p * FEE_RATE;
 
             if (t.isBuyer) {
-                totalQty += qty;
-                totalSpent += qty * price + feeCost; // include fee
-            } else {
-                // proportionally remove sold qty and fees
-                if (totalQty > 0) {
-                    const avgPrice = totalSpent / totalQty;
-                    totalQty -= qty;
-                    totalSpent -= qty * avgPrice;
-                    if (totalQty < 0) totalQty = 0;
-                    if (totalSpent < 0) totalSpent = 0;
-                }
+                qty += q;
+                cost += q * p + fee;
+            } else if (qty > 0) {
+                const avg = cost / qty;
+                qty -= q;
+                cost -= q * avg;
             }
-        });
+        }
 
-        const breakEven = totalQty > 0 ? totalSpent / totalQty : 0;
-
-        console.log(`Open position break-even for ${symbol} (with fees): $${breakEven.toFixed(8)} over ${totalQty.toFixed(8)} units`);
+        const be = qty > 0 ? cost / qty : 0;
 
         res.json({
-            averagePrice: breakEven.toFixed(8),
-            breakEven: breakEven.toFixed(8),
-            totalQuantity: totalQty.toFixed(8),
-            totalSpent: totalSpent.toFixed(2)
+            breakEven: be.toFixed(8),
+            averagePrice: be.toFixed(8),
+            totalQuantity: qty.toFixed(8)
         });
 
-    } catch (err) {
-        console.error("Break-even error:", err.response?.data || err.message);
-        res.status(500).json({ error: err.response?.data || err.message });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
-
-// ----------------------------------------
-app.listen(5000, () =>
-    console.log("Binance.US local API running → http://localhost:5000")
-);
+// ------------------------------
+app.listen(5000, () => {
+    console.log("Binance.US Spot API running → http://localhost:5000");
+});
