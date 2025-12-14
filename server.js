@@ -340,7 +340,3 @@ app.get("/breakeven/:symbol", async (req, res) => {
     }
 });
 
-// ------------------------------
-app.listen(5000, '0.0.0.0', () => {
-  console.log("Server running on 0.0.0.0:5000");
-});
