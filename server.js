@@ -18,6 +18,17 @@ const API_KEY = process.env.BINANCE_API_KEY;
 const API_SECRET = process.env.BINANCE_API_SECRET;
 const BASE = "https://api.binance.us";
 const FEE_RATE = parseFloat(process.env.BINANCE_FEE || 0.001);
+const fs = require("fs");
+const https = require("https");
+
+const options = {
+  key: fs.readFileSync("/home/ec2-user/certs/server.key"),
+  cert: fs.readFileSync("/home/ec2-user/certs/server.crt")
+};
+
+https.createServer(options, app).listen(5000, '0.0.0.0', () => {
+  console.log("HTTPS server running on 0.0.0.0:5000");
+});
 
 // ------------------------------
 // SIMPLE IN-MEMORY CACHE
