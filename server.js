@@ -40,6 +40,24 @@ function signQuery(params) {
     const sig = crypto.createHmac("sha256", API_SECRET).update(qs).digest("hex");
     return qs + "&signature=" + sig;
 }
+const exchangeInfoCache = { data: null, ts: 0 };
+const EXCHANGE_INFO_TTL = 60 * 60 * 1000; // 1 hour
+
+async function getExchangeInfo() {
+    if (exchangeInfoCache.data && Date.now() - exchangeInfoCache.ts < EXCHANGE_INFO_TTL) {
+        return exchangeInfoCache.data;
+    }
+
+    const r = await axios.get(`${BASE}/api/v3/exchangeInfo`);
+    exchangeInfoCache.data = r.data;
+    exchangeInfoCache.ts = Date.now();
+    return r.data;
+}
+
+function adjustToStepSize(qty, stepSize) {
+    const precision = Math.round(Math.log10(1 / stepSize));
+    return (Math.floor(qty / stepSize) * stepSize).toFixed(precision);
+}
 
 // ------------------------------
 // CACHED HELPERS
@@ -105,6 +123,72 @@ app.get("/balances", async (req, res) => {
         res.status(500).json({ error: e.message });
     }
 });
+
+app.post("/order", async (req, res) => {
+    try {
+        const {
+            symbol,
+            side,
+            quantity,
+            type = "MARKET",
+            price,
+            timeInForce
+        } = req.body;
+
+        if (!symbol || !side || !quantity) {
+            return res.status(400).json({ error: "Missing required parameters" });
+        }
+
+        const info = await getExchangeInfo();
+        const sym = info.symbols.find(s => s.symbol === symbol);
+        if (!sym) return res.status(400).json({ error: "Unknown symbol" });
+
+        const lot = sym.filters.find(f => f.filterType === "LOT_SIZE");
+        const stepSize = parseFloat(lot.stepSize);
+        const minQty = parseFloat(lot.minQty);
+
+        let qty = parseFloat(quantity);
+        qty = parseFloat(adjustToStepSize(qty, stepSize));
+
+        if (qty < minQty) {
+            return res.status(400).json({
+                error: `Quantity ${qty} < minQty ${minQty}`
+            });
+        }
+
+        const params = {
+            symbol,
+            side,
+            type,
+            quantity: qty,
+            timestamp: Date.now()
+        };
+
+        if (type === "LIMIT") {
+            if (!price) {
+                return res.status(400).json({ error: "LIMIT requires price" });
+            }
+            params.price = price;
+            params.timeInForce = timeInForce || "GTC";
+        }
+
+        const qs = signQuery(params);
+
+        const r = await axios.post(
+            `${BASE}/api/v3/order?${qs}`,
+            null,
+            { headers: { "X-MBX-APIKEY": API_KEY } }
+        );
+
+        res.json(r.data);
+
+    } catch (e) {
+        console.error("Order error:", e.response?.data || e.message);
+        res.status(500).json(e.response?.data || { error: e.message });
+    }
+});
+
+
 
 // ------------------------------
 // POSITIONS (OPEN ONLY, >$10, FIFO, FEES)
