@@ -119,6 +119,14 @@ app.use((req, res, next) => {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     next();
 });
+app.get("/exchangeInfo", async (req, res) => {
+  try {
+    const r = await axios.get("https://api.binance.us/api/v3/exchangeInfo");
+    res.json(r.data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ------------------------------
 // BALANCES
