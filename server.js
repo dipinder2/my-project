@@ -1,5 +1,5 @@
 // ------------------------------
-// Binance.US Spot Backend
+// Binance.US Spot Backend (HTTP)
 // Open Positions + Break-even + P&L (RATE-LIMIT SAFE)
 // ------------------------------
 
@@ -18,30 +18,18 @@ const API_KEY = process.env.BINANCE_API_KEY;
 const API_SECRET = process.env.BINANCE_API_SECRET;
 const BASE = "https://api.binance.us";
 const FEE_RATE = parseFloat(process.env.BINANCE_FEE || 0.001);
-const fs = require("fs");
-const https = require("https");
-
-const options = {
-  key: fs.readFileSync("/home/ec2-user/certs/server.key"),
-  cert: fs.readFileSync("/home/ec2-user/certs/server.crt")
-};
-
-https.createServer(options, app).listen(5000, '0.0.0.0', () => {
-  console.log("HTTPS server running on 0.0.0.0:5000");
-});
 
 // ------------------------------
 // SIMPLE IN-MEMORY CACHE
 // ------------------------------
 const cache = {
     account: { data: null, ts: 0 },
-    trades: {},   // symbol -> { data, ts }
-    prices: {}    // symbol -> { price, ts }
+    trades: {},
+    prices: {}
 };
-
-const ACCOUNT_TTL = 5000;   // 5s
-const TRADES_TTL  = 60000;  // 60s
-const PRICE_TTL   = 5000;   // 5s
+const ACCOUNT_TTL = 5000;
+const TRADES_TTL = 60000;
+const PRICE_TTL = 5000;
 
 // ------------------------------
 // SIGN QUERY
@@ -51,14 +39,12 @@ function signQuery(params) {
     const sig = crypto.createHmac("sha256", API_SECRET).update(qs).digest("hex");
     return qs + "&signature=" + sig;
 }
+
 const exchangeInfoCache = { data: null, ts: 0 };
-const EXCHANGE_INFO_TTL = 60 * 60 * 1000; // 1 hour
+const EXCHANGE_INFO_TTL = 60 * 60 * 1000;
 
 async function getExchangeInfo() {
-    if (exchangeInfoCache.data && Date.now() - exchangeInfoCache.ts < EXCHANGE_INFO_TTL) {
-        return exchangeInfoCache.data;
-    }
-
+    if (exchangeInfoCache.data && Date.now() - exchangeInfoCache.ts < EXCHANGE_INFO_TTL) return exchangeInfoCache.data;
     const r = await axios.get(`${BASE}/api/v3/exchangeInfo`);
     exchangeInfoCache.data = r.data;
     exchangeInfoCache.ts = Date.now();
@@ -74,15 +60,9 @@ function adjustToStepSize(qty, stepSize) {
 // CACHED HELPERS
 // ------------------------------
 async function getAccountCached() {
-    if (cache.account.data && Date.now() - cache.account.ts < ACCOUNT_TTL) {
-        return cache.account.data;
-    }
-
+    if (cache.account.data && Date.now() - cache.account.ts < ACCOUNT_TTL) return cache.account.data;
     const qs = signQuery({ timestamp: Date.now() });
-    const r = await axios.get(`${BASE}/api/v3/account?${qs}`, {
-        headers: { "X-MBX-APIKEY": API_KEY }
-    });
-
+    const r = await axios.get(`${BASE}/api/v3/account?${qs}`, { headers: { "X-MBX-APIKEY": API_KEY } });
     cache.account = { data: r.data, ts: Date.now() };
     return r.data;
 }
@@ -90,14 +70,9 @@ async function getAccountCached() {
 async function getTradesCached(symbol) {
     const c = cache.trades[symbol];
     if (c && Date.now() - c.ts < TRADES_TTL) return c.data;
-
     const q = `symbol=${symbol}&timestamp=${Date.now()}`;
     const sig = crypto.createHmac("sha256", API_SECRET).update(q).digest("hex");
-
-    const r = await axios.get(`${BASE}/api/v3/myTrades?${q}&signature=${sig}`, {
-        headers: { "X-MBX-APIKEY": API_KEY }
-    });
-
+    const r = await axios.get(`${BASE}/api/v3/myTrades?${q}&signature=${sig}`, { headers: { "X-MBX-APIKEY": API_KEY } });
     cache.trades[symbol] = { data: r.data, ts: Date.now() };
     return r.data;
 }
@@ -105,65 +80,27 @@ async function getTradesCached(symbol) {
 async function getPriceCached(symbol) {
     const c = cache.prices[symbol];
     if (c && Date.now() - c.ts < PRICE_TTL) return c.price;
-
     const r = await axios.get(`${BASE}/api/v3/ticker/price?symbol=${symbol}`);
     const price = parseFloat(r.data.price);
-
     cache.prices[symbol] = { price, ts: Date.now() };
     return price;
 }
 
-
-
+// ------------------------------
+// LOG REQUESTS
+// ------------------------------
 app.use((req, res, next) => {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     next();
 });
-app.get("/exchangeInfo", async (req, res) => {
-  try {
-    const r = await axios.get("https://api.binance.us/api/v3/exchangeInfo");
-    res.json(r.data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // ------------------------------
-// BALANCES
+// ORDERS
 // ------------------------------
-app.get("/balances", async (req, res) => {
-    try {
-        const acct = await getAccountCached();
-
-        const balances = acct.balances
-            .map(b => ({
-                asset: b.asset,
-                free: b.free,
-                locked: b.locked,
-                total: (parseFloat(b.free) + parseFloat(b.locked)).toFixed(8)
-            }))
-            .filter(b => parseFloat(b.total) > 0);
-
-        res.json(balances);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
 app.post("/order", async (req, res) => {
     try {
-        const {
-            symbol,
-            side,
-            quantity,
-            type = "MARKET",
-            price,
-            timeInForce
-        } = req.body;
-
-        if (!symbol || !side || !quantity) {
-            return res.status(400).json({ error: "Missing required parameters" });
-        }
+        const { symbol, side, quantity, type = "MARKET", price, timeInForce } = req.body;
+        if (!symbol || !side || !quantity) return res.status(400).json({ error: "Missing required parameters" });
 
         const info = await getExchangeInfo();
         const sym = info.symbols.find(s => s.symbol === symbol);
@@ -175,120 +112,54 @@ app.post("/order", async (req, res) => {
 
         let qty = parseFloat(quantity);
         qty = parseFloat(adjustToStepSize(qty, stepSize));
+        if (qty < minQty) return res.status(400).json({ error: `Quantity ${qty} < minQty ${minQty}` });
 
-        if (qty < minQty) {
-            return res.status(400).json({
-                error: `Quantity ${qty} < minQty ${minQty}`
-            });
-        }
-
-        const params = {
-            symbol,
-            side,
-            type,
-            quantity: qty,
-            timestamp: Date.now()
-        };
-
+        const params = { symbol, side, type, quantity: qty, timestamp: Date.now() };
         if (type === "LIMIT") {
-            if (!price) {
-                return res.status(400).json({ error: "LIMIT requires price" });
-            }
+            if (!price) return res.status(400).json({ error: "LIMIT requires price" });
             params.price = price;
             params.timeInForce = timeInForce || "GTC";
         }
 
         const qs = signQuery(params);
-
-        const r = await axios.post(
-            `${BASE}/api/v3/order?${qs}`,
-            null,
-            { headers: { "X-MBX-APIKEY": API_KEY } }
-        );
-
+        const r = await axios.post(`${BASE}/api/v3/order?${qs}`, null, { headers: { "X-MBX-APIKEY": API_KEY } });
         res.json(r.data);
-
     } catch (e) {
         console.error("Order error:", e.response?.data || e.message);
         res.status(500).json(e.response?.data || { error: e.message });
     }
 });
 
-
-
 // ------------------------------
-// POSITIONS (OPEN ONLY, >$10, FIFO, FEES)
+// POSITIONS
 // ------------------------------
 app.get("/positions", async (req, res) => {
     try {
         const acct = await getAccountCached();
-        console.log("Calculating positions for account:", acct.accountType);
-        const assets = acct.balances
-            .map(b => ({
-                asset: b.asset,
-                qty: parseFloat(b.free) + parseFloat(b.locked)
-            }))
-            .filter(b =>
-                b.qty > 0 &&
-                !["USD", "USDT", "USDC"].includes(b.asset)
-            );
-
+        const assets = acct.balances.map(b=>({ asset:b.asset, qty:parseFloat(b.free)+parseFloat(b.locked) }))
+                                   .filter(a=>a.qty>0 && !["USD","USDT","USDC"].includes(a.asset));
         const positions = [];
 
         for (const a of assets) {
-            const symbolCandidates = [
-                `${a.asset}USDT`,
-                `${a.asset}USDC`,
-                `${a.asset}USD`
-            ];
+            const symbolCandidates = [`${a.asset}USDT`, `${a.asset}USDC`, `${a.asset}USD`];
+            let symbol=null, trades=null, price=null;
 
-            let symbol = null;
-            let trades = null;
-            let price = null;
-
-            // Resolve correct symbol safely
-            for (const s of symbolCandidates) {
-                try {
-                    const t = await getTradesCached(s);
-                    if (!t.length) continue;
-
-                    symbol = s;
-                    trades = t;
-                    price = await getPriceCached(s);
-                    break;
-                } catch {}
+            for(const s of symbolCandidates){
+                try{ const t = await getTradesCached(s); if(t.length){symbol=s; trades=t; price=await getPriceCached(s); break;} } catch{}
             }
+            if(!symbol || !trades || price===null) continue;
 
-            if (!symbol || !trades || price === null) continue;
-
-            // FIFO open-position calculation
-            let openQty = 0;
-            let openCost = 0;
-
-            for (const t of trades) {
-                const qty = parseFloat(t.qty);
-                const p = parseFloat(t.price);
-                const fee = qty * p * FEE_RATE;
-
-                if (t.isBuyer) {
-                    openQty += qty;
-                    openCost += qty * p + fee;
-                } else if (openQty > 0) {
-                    const avg = openCost / openQty;
-                    openQty -= qty;
-                    openCost -= qty * avg;
-                    if (openQty < 0) openQty = 0;
-                    if (openCost < 0) openCost = 0;
-                }
+            let openQty=0, openCost=0;
+            for(const t of trades){
+                const qty=parseFloat(t.qty), p=parseFloat(t.price), fee=qty*p*FEE_RATE;
+                if(t.isBuyer){ openQty+=qty; openCost+=qty*p+fee; }
+                else if(openQty>0){ const avg=openCost/openQty; openQty-=qty; openCost-=qty*avg; if(openQty<0) openQty=0; if(openCost<0) openCost=0; }
             }
-
-            if (openQty <= 0) continue;
-
-            const value = openQty * price;
-            if (value < 10) continue; // 🔥 filter <$10
-
-            const breakEven = openCost / openQty;
-            const pnl = (price - breakEven) * openQty;
+            if(openQty<=0) continue;
+            const value=openQty*price;
+            if(value<10) continue;
+            const breakEven=openCost/openQty;
+            const pnl=(price-breakEven)*openQty;
 
             positions.push({
                 symbol,
@@ -302,49 +173,31 @@ app.get("/positions", async (req, res) => {
         }
 
         res.json(positions);
-
-    } catch (e) {
+    } catch(e){
         console.error("Positions error:", e.message);
         res.status(500).json({ error: e.message });
     }
 });
 
 // ------------------------------
-// BREAK-EVEN (CONSISTENT WITH POSITIONS)
+// BREAK-EVEN
 // ------------------------------
 app.get("/breakeven/:symbol", async (req, res) => {
     try {
-        const symbol = req.params.symbol.toUpperCase();
-        const trades = await getTradesCached(symbol);
-
-        let qty = 0;
-        let cost = 0;
-
-        for (const t of trades) {
-            const q = parseFloat(t.qty);
-            const p = parseFloat(t.price);
-            const fee = q * p * FEE_RATE;
-
-            if (t.isBuyer) {
-                qty += q;
-                cost += q * p + fee;
-            } else if (qty > 0) {
-                const avg = cost / qty;
-                qty -= q;
-                cost -= q * avg;
-            }
+        const symbol=req.params.symbol.toUpperCase();
+        const trades=await getTradesCached(symbol);
+        let qty=0, cost=0;
+        for(const t of trades){
+            const q=parseFloat(t.qty), p=parseFloat(t.price), fee=q*p*FEE_RATE;
+            if(t.isBuyer){ qty+=q; cost+=q*p+fee; } 
+            else if(qty>0){ const avg=cost/qty; qty-=q; cost-=q*avg; }
         }
-
-        const be = qty > 0 ? cost / qty : 0;
-
-        res.json({
-            breakEven: be.toFixed(8),
-            averagePrice: be.toFixed(8),
-            totalQuantity: qty.toFixed(8)
-        });
-
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+        const be = qty>0? cost/qty : 0;
+        res.json({ breakEven: be.toFixed(8), averagePrice: be.toFixed(8), totalQuantity: qty.toFixed(8) });
+    } catch(e){ res.status(500).json({ error:e.message }); }
 });
 
+// ------------------------------
+// START HTTP SERVER
+// ------------------------------
+app.listen(5000, '0.0.0.0', ()=>console.log("HTTP server running on 0.0.0.0:5000"));
